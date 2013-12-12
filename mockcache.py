@@ -49,79 +49,89 @@ This module and other memcached client libraries have the same behavior.
     >>> mc.get("a")
     '1234'
     >>> mc
-    <mockcache.Client {'a': ('1234', None)}>
+    <mockcache.Client {'a': ('1234', None, 1)}>
     >>> mc.add("a", "1111")
     0
     >>> mc.get("a")
     '1234'
     >>> mc
-    <mockcache.Client {'a': ('1234', None)}>
+    <mockcache.Client {'a': ('1234', None, 1)}>
     >>> mc.replace("a", "2222")
     1
     >>> mc.get("a")
     '2222'
     >>> mc
-    <mockcache.Client {'a': ('2222', None)}>
+    <mockcache.Client {'a': ('2222', None, 2)}>
     >>> mc.append("a", "3")
     1
     >>> mc.get("a")
     '22223'
     >>> mc
-    <mockcache.Client {'a': ('22223', None)}>
+    <mockcache.Client {'a': ('22223', None, 3)}>
     >>> mc.prepend("a", "1")
     1
     >>> mc.get("a")
     '122223'
     >>> mc
-    <mockcache.Client {'a': ('122223', None)}>
+    <mockcache.Client {'a': ('122223', None, 4)}>
     >>> mc.incr("a")
     122224
     >>> mc.get("a")
     122224
     >>> mc
-    <mockcache.Client {'a': (122224, None)}>
+    <mockcache.Client {'a': (122224, None, 5)}>
     >>> mc.incr("a", 10)
     122234
     >>> mc.get("a")
     122234
     >>> mc
-    <mockcache.Client {'a': (122234, None)}>
+    <mockcache.Client {'a': (122234, None, 6)}>
     >>> mc.decr("a")
     122233
     >>> mc.get("a")
     122233
     >>> mc
-    <mockcache.Client {'a': (122233, None)}>
+    <mockcache.Client {'a': (122233, None, 7)}>
     >>> mc.decr("a", 5)
     122228
     >>> mc.get("a")
     122228
     >>> mc
-    <mockcache.Client {'a': (122228, None)}>
+    <mockcache.Client {'a': (122228, None, 8)}>
     >>> mc.replace("b", "value")
     0
     >>> mc.get("b")
     >>> mc.get("b") is None
     True
     >>> mc
-    <mockcache.Client {'a': (122228, None)}>
+    <mockcache.Client {'a': (122228, None, 8)}>
     >>> mc.add("b", "value", 5)
     1
     >>> mc.get("b")
     'value'
     >>> mc  # doctest: +ELLIPSIS
-    <mockcache.Client {'a': (122228, None), 'b': ('value', ...)}>
+    <mockcache.Client {'a': (122228, None, 8), 'b': ('value', ...)}>
     >>> import time
     >>> time.sleep(6)
     >>> mc.get("b")
     >>> mc.get("b") is None
     True
     >>> mc
-    <mockcache.Client {'a': (122228, None)}>
-    >>> mc.set("c", "value")
+    <mockcache.Client {'a': (122228, None, 8)}>
+    >>> mc.set("c", "foo")
     1
+    >>> mc.gets("c")
+    'foo'
+    >>> mc.cas("c", "bar")
+    1
+    >>> mc.gets("c")
+    'bar'
+    >>> mc.set("c", "foo")
+    1
+    >>> mc.cas("c", "baz")
+    0
     >>> mc.get_multi(["a", "b", "c"])
-    {'a': 122228, 'c': 'value'}
+    {'a': 122228, 'c': 'foo'}
     >>> mc.delete("a")
     1
     >>> mc.get("a") is None
@@ -165,7 +175,7 @@ class Client(object):
 
     """
 
-    __slots__ = "dictionary",
+    __slots__ = "dictionary", "cas_ids"
 
     # exceptions for Client
     class MockcachedKeyError(Exception):
@@ -186,7 +196,10 @@ class Client(object):
         compatibility so ignored.
 
         """
+        # map of key to (value, expiration_time, unique_id) tuple
         self.dictionary = {}
+        # attribute name is intentionally compatible with python-memcached
+        self.cas_ids = {}
 
     def set_servers(self, servers):
         """Does nothing, like `__init__`. Just for compatibility."""
@@ -202,18 +215,19 @@ class Client(object):
             if int(time) < 1:
                 del self.dictionary[key]
                 return 1
+            # support for delete lock time here is surely broken
             self.set(key, self.dictionary[key], time)
         return 0
 
     def incr(self, key, delta=1):
         """Increments an integer by the `key`."""
         try:
-            value, exp = self.dictionary[key]
+            value, exp, id = self.dictionary[key]
         except KeyError:
             return
         else:
             value = int(value) + delta
-            self.dictionary[key] = value, exp
+            self.dictionary[key] = value, exp, id + 1
             return value
 
     def decr(self, key, delta=1):
@@ -226,8 +240,8 @@ class Client(object):
 
         """
         try:
-            self.dictionary[key] = str(self.dictionary[key][0]) + val, \
-                                   self.dictionary[key][1]
+            value, exp, id = self.dictionary[key]
+            self.dictionary[key] = str(value) + val, exp, id + 1
         except KeyError:
             return 0
         else:
@@ -239,8 +253,8 @@ class Client(object):
 
         """
         try:
-            self.dictionary[key] = val + str(self.dictionary[key][0]), \
-                                   self.dictionary[key][1]
+            value, exp, id = self.dictionary[key]
+            self.dictionary[key] = val + str(value), exp, id + 1
         except KeyError:
             return 0
         else:
@@ -273,14 +287,41 @@ class Client(object):
             time = datetime.datetime.now() + datetime.timedelta(0, time)
         else:
             time = datetime.datetime.fromtimestamp(time)
-        self.dictionary[key] = val, time
+        _, _, id = self.dictionary.get(key, (None, None, 0))
+        self.dictionary[key] = val, time, id + 1
         return 1
+
+    def cas(self, key, value, time=0):
+        if not (key in self.dictionary and key in self.cas_ids):
+            return 0
+        _, _, id = self.dictionary[key]
+        if id != self.cas_ids[key]:
+            return 0
+        return self.set(key, value, time)
+
+    def reset_cas(self):
+        self.cas_ids.clear()
 
     def get(self, key):
         """Retrieves a value of the `key` from the internal dictionary."""
         check_key(key)
         try:
-            val, exptime = self.dictionary[key]
+            val, exptime, _ = self.dictionary[key]
+        except KeyError:
+            return
+        else:
+            if exptime and exptime < datetime.datetime.now():
+                del self.dictionary[key]
+                return
+            return val
+
+    def gets(self, key):
+        """Retrieves a value of the `key` from the internal dictionary,
+        recording state for future mcas calls."""
+        check_key(key)
+        try:
+            val, exptime, id = self.dictionary[key]
+            self.cas_ids[key] = id
         except KeyError:
             return
         else:
@@ -298,7 +339,7 @@ class Client(object):
         pairs = ((key, self.dictionary[key]) for key in keys
                                              if key in dictionary)
         now = datetime.datetime.now
-        return dict((key, value) for key, (value, exp) in pairs
+        return dict((key, value) for key, (value, exp, _) in pairs
                                  if not exp or exp > now())
 
     def __repr__(self):
